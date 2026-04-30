@@ -1,0 +1,9 @@
+trimesh[easy]>=4.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+nbtlib>=1.0.0
+scipy>=1.10.0
+scikit-image>=0.21.0
+pygltflib>=1.15.0
+rtree>=1.0.0
+customtkinter>=5.2.0
