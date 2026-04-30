@@ -109,25 +109,101 @@ def voxelize(
     # 1. Escalar la malla para que quepa exactamente en target_size
     mesh_scaled = _scale_mesh(mesh, W, H, D)
 
-    # 2. Voxelizar con pitch=1.0 (1 vóxel = 1 bloque)
-    vox = mesh_scaled.voxelized(pitch=1.0)
+    # 2. Voxelización a alta resolución + relleno + downsampling.
+    #
+    #    El problema de huecos en TRELLIS viene de que los meshes no son
+    #    herméticos y los triángulos finos caen entre vóxeles coarse.
+    #    Solución: voxelizar a 4× resolución (pitch=0.25), rellenar
+    #    con scipy.ndimage.binary_fill_holes (implementación C, rápida),
+    #    y luego hacer downsample any() al grid coarse objetivo.
+    #
+    #    - fine_factor=4: fine cell = 0.25 coarse voxels → captura todos
+    #      los triángulos que antes caían en huecos entre vóxeles.
+    #    - binary_fill_holes: equivalente a BFS exterior pero en C;
+    #      opera sobre el grid fino donde los gaps son 4× más pequeños
+    #      y por tanto se cierran solos.
+    #    - Downsample: coarse[x,y,z] = any(fine[4x:4x+4, 4y:4y+4, 4z:4z+4])
+    #
+    from scipy.ndimage import binary_fill_holes as _bfh
+    from scipy.ndimage import binary_closing as _bclosing
+    from scipy.ndimage import label as _label
 
-    if fill_interior:
-        vox = vox.fill()
+    # Factor de subdivisión: cap para modelos muy grandes (memoria)
+    fine_factor = 4 if max(W, H, D) <= 128 else 2
+    fine_pitch = 1.0 / fine_factor
+    FW, FH, FD = W * fine_factor, H * fine_factor, D * fine_factor
 
-    # 3. Obtener posiciones de vóxeles ocupados como enteros
-    # trimesh retorna centros de vóxeles; los redondeamos y convertimos a int
-    centers = vox.points  # shape (N, 3), float
-    positions = np.floor(centers).astype(int)
+    print(f"[VOX] grid objetivo: {W}×{H}×{D}  |  fine_factor={fine_factor}  |  grid fino: {FW}×{FH}×{FD}")
+    print(f"[VOX] fill_interior={fill_interior}  |  shadow_removal={shadow_removal}")
 
-    # Clip para que estén dentro de los límites
-    positions[:, 0] = np.clip(positions[:, 0], 0, W - 1)
-    positions[:, 1] = np.clip(positions[:, 1], 0, H - 1)
-    positions[:, 2] = np.clip(positions[:, 2], 0, D - 1)
+    vox_fine = mesh_scaled.voxelized(pitch=fine_pitch)
+    fine_pts = np.floor(vox_fine.points * fine_factor).astype(int)
+    fine_pts[:, 0] = np.clip(fine_pts[:, 0], 0, FW - 1)
+    fine_pts[:, 1] = np.clip(fine_pts[:, 1], 0, FH - 1)
+    fine_pts[:, 2] = np.clip(fine_pts[:, 2], 0, FD - 1)
 
-    # 4. Construir grid de ocupación (se reutiliza en superficie + shape hints)
-    occupied = np.zeros((W, H, D), dtype=bool)
-    occupied[positions[:, 0], positions[:, 1], positions[:, 2]] = True
+    fine_shell = np.zeros((FW, FH, FD), dtype=bool)
+    fine_shell[fine_pts[:, 0], fine_pts[:, 1], fine_pts[:, 2]] = True
+    print(f"[VOX] cáscara fina cruda: {fine_shell.sum():,} celdas")
+
+    # Paso 1: closing fino para sellar gaps sub-vóxel
+    fine_shell = _bclosing(fine_shell, iterations=1)
+    print(f"[VOX] cáscara fina tras closing(1): {fine_shell.sum():,} celdas")
+
+    # Paso 2: downsample cáscara al grid coarse
+    fine_crop_shell = fine_shell[:W * fine_factor, :H * fine_factor, :D * fine_factor]
+    coarse_shell = (
+        fine_crop_shell
+        .reshape(W, fine_factor, H, fine_factor, D, fine_factor)
+        .any(axis=(1, 3, 5))
+    )
+    print(f"[VOX] cáscara coarse tras downsample: {coarse_shell.sum():,} vóxeles")
+
+    # Paso 3: closing coarse para sellar gaps de 1-2 bloques
+    coarse_shell = _bclosing(coarse_shell, iterations=2)
+    print(f"[VOX] cáscara coarse tras closing(2): {coarse_shell.sum():,} vóxeles")
+
+    # Paso 4: rellenar sólido completo
+    occupied = _bfh(coarse_shell)
+    solid_count = occupied.sum()
+    print(f"[VOX] sólido tras binary_fill_holes: {solid_count:,} vóxeles")
+
+    # Diagnóstico de fugas: si fill_holes no rellenó nada, la cáscara sigue abierta
+    added_by_fill = int(solid_count) - int(coarse_shell.sum())
+    print(f"[VOX] vóxeles añadidos por fill_holes: {added_by_fill:,}  ({'OK — se rellenó interior' if added_by_fill > 0 else '⚠ NADA — cáscara posiblemente abierta'})")
+
+    # Diagnóstico de agujeros visibles
+    empty_grid = ~occupied
+    _lbl, _nlbl = _label(empty_grid)
+    _ext_lbl = _lbl[0, 0, 0]
+    _ext_size = int((_lbl == _ext_lbl).sum())
+    _int_size = int(empty_grid.sum()) - _ext_size
+    _expected_ext = int(empty_grid.sum()) - _int_size
+    _leak = _ext_size - _expected_ext
+    print(f"[VOX] diagnóstico sólido → exterior={_ext_size:,}  interior_cerrado={_int_size:,}  fuga={_leak}")
+
+    # En modo hueco: extraer solo la cáscara superficial
+    if not fill_interior:
+        padded = np.pad(occupied, 1, constant_values=False)
+        has_empty_nb = np.zeros((W, H, D), dtype=bool)
+        for _dx, _dy, _dz in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
+            has_empty_nb |= ~padded[1+_dx:W+1+_dx, 1+_dy:H+1+_dy, 1+_dz:D+1+_dz]
+        occupied = occupied & has_empty_nb
+        print(f"[VOX] modo HUECO → cáscara final: {occupied.sum():,} vóxeles")
+
+        # Diagnóstico de agujeros en la cáscara final
+        empty2 = ~occupied
+        _lbl2, _nlbl2 = _label(empty2)
+        _ext2 = int((_lbl2 == _lbl2[0,0,0]).sum())
+        _int2 = int(empty2.sum()) - _ext2
+        _leak2 = _ext2 - (int(empty2.sum()) - _int2)
+        print(f"[VOX] diagnóstico cáscara → exterior={_ext2:,}  cámaras_internas={_nlbl2-1}  fuga={_leak2}")
+    else:
+        print(f"[VOX] modo SÓLIDO → total: {occupied.sum():,} vóxeles")
+
+    # 4. Extraer posiciones desde el grid resultante
+    xs, ys, zs = np.where(occupied)
+    positions = np.stack([xs, ys, zs], axis=1).astype(int)
 
     # 5. Identificar vóxeles de superficie
     is_surface = _find_surface_voxels(positions, occupied, W, H, D)
@@ -140,16 +216,16 @@ def voxelize(
         mesh_scaled, texture, positions, is_surface
     )
 
-    # 8. Corrección de sombras: normalización de luminosidad en superficie
+    # 8. BFS: rellenar vóxeles de superficie con alpha=0 (huecos UV / textura
+    #     transparente) propagando el color del vecino válido más cercano.
+    colors = _bfs_fill_colors(colors, positions, is_surface, W, H, D)
+
+    # 9. Corrección de sombras: normalización de luminosidad en superficie
     if shadow_removal:
         colors = _remove_shadow_from_colors(colors, is_surface)
 
     return VoxelGrid(positions, colors, is_surface, (W, H, D), shape_hints)
 
-
-# ---------------------------------------------------------------------------
-# Funciones auxiliares
-# ---------------------------------------------------------------------------
 
 def _scale_mesh(mesh: trimesh.Trimesh, W: int, H: int, D: int) -> trimesh.Trimesh:
     """
@@ -295,6 +371,152 @@ def _compute_shape_hints(
 
     hints[surface_idx] = sh
     return hints
+
+
+def _raycasting_fill(
+    mesh: trimesh.Trimesh,
+    shell: np.ndarray,
+    W: int, H: int, D: int,
+) -> np.ndarray:
+    """
+    Determina el interior de la malla mediante ray casting.
+
+    Para cada posición del grid W×H×D, lanza rayos en múltiples direcciones
+    y vota si el punto es "dentro" o "fuera" del sólido.  trimesh.contains()
+    implementa esto con robustez para meshes no herméticos.
+
+    El resultado es: cáscara voxelizada ∪ puntos interiores según el mesh.
+    Esto es geométricamente correcto y nunca fusiona partes separadas del modelo.
+    """
+    # Construir todos los centros de vóxel del grid
+    xi = np.arange(W, dtype=np.float32) + 0.5
+    yi = np.arange(H, dtype=np.float32) + 0.5
+    zi = np.arange(D, dtype=np.float32) + 0.5
+    gx, gy, gz = np.meshgrid(xi, yi, zi, indexing='ij')
+    all_centers = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+
+    try:
+        inside = mesh.contains(all_centers)          # bool (W*H*D,)
+        interior_grid = inside.reshape(W, H, D)
+    except Exception:
+        # Fallback conservador: sólo la cáscara (sin relleno interior)
+        interior_grid = np.zeros((W, H, D), dtype=bool)
+
+    return shell | interior_grid
+
+
+def _exterior_bfs_fill(shell: np.ndarray, W: int, H: int, D: int) -> np.ndarray:
+    """
+    Rellena el interior de la cáscara voxelizada usando BFS exterior con padding.
+
+    Estrategia (robusta para meshes no herméticos):
+    1. Crea un grid de (W+2)×(H+2)×(D+2) con un borde de aire garantizado.
+    2. Hace BFS desde la esquina (0,0,0) marcando todo lo accesible desde
+       el exterior como "aire exterior".
+    3. Todo lo que NO es accesible desde el exterior → relleno sólido.
+
+    Esto funciona aunque la cáscara tenga agujeros pequeños, porque el
+    closing morfológico previo los habrá cerrado.
+    """
+    from collections import deque
+
+    # Grid con padding de 1 en cada lado
+    PW, PH, PD = W + 2, H + 2, D + 2
+    padded = np.zeros((PW, PH, PD), dtype=bool)
+    # Insertar la cáscara con offset (1,1,1)
+    padded[1:W+1, 1:H+1, 1:D+1] = shell
+
+    exterior = np.zeros((PW, PH, PD), dtype=bool)
+    exterior[0, 0, 0] = True
+    queue = deque([(0, 0, 0)])
+
+    DIRS = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
+
+    while queue:
+        px, py, pz = queue.popleft()
+        for dx, dy, dz in DIRS:
+            nx, ny, nz = px+dx, py+dy, pz+dz
+            if 0 <= nx < PW and 0 <= ny < PH and 0 <= nz < PD:
+                if not exterior[nx, ny, nz] and not padded[nx, ny, nz]:
+                    exterior[nx, ny, nz] = True
+                    queue.append((nx, ny, nz))
+
+    # Interior = todo lo no-exterior dentro del bounding box original
+    interior_padded = ~exterior[1:W+1, 1:H+1, 1:D+1]
+    # Resultado: cáscara unión interior
+    return shell | interior_padded
+
+
+def _bfs_fill_colors(
+    colors: np.ndarray,
+    positions: np.ndarray,
+    is_surface: np.ndarray,
+    W: int, H: int, D: int,
+) -> np.ndarray:
+    """
+    Rellena vóxeles de superficie con color inválido (alpha == 0) propagando
+    el color del vecino válido más cercano mediante BFS 3D.
+
+    Escenarios cubiertos:
+    - Regiones de textura con alpha=0 (zonas transparentes del GLB).
+    - Huecos de UV sin cobertura (seams, backfaces sin textura).
+
+    El BFS parte de todos los vóxeles con alpha > 0 como semillas y se
+    expande hacia los vecinos en las 6 direcciones cardinales.  Los vóxeles
+    interiores actúan como "puente" para que la propagación llegue a vóxeles
+    de superficie aislados.  Cada vóxel se visita exactamente una vez →
+    complejidad O(N) sin riesgo de propagación infinita.
+    """
+    from collections import deque
+
+    result = colors.copy()
+
+    # Vóxeles de superficie con color inválido (alpha == 0)
+    invalid_mask = is_surface & (result[:, 3] == 0)
+    if not np.any(invalid_mask):
+        return result
+
+    # Mapa posición → índice en el array
+    pos_map: dict[tuple, int] = {
+        (int(positions[i, 0]), int(positions[i, 1]), int(positions[i, 2])): i
+        for i in range(len(positions))
+    }
+
+    visited = np.zeros(len(positions), dtype=bool)
+
+    # Semillas: todos los vóxeles con color válido (alpha > 0).
+    # La cola almacena (índice, color_a_propagar) para mantener el color
+    # fuente incluso cuando la expansión atraviesa vóxeles interiores.
+    queue: deque = deque()
+    for i in np.where(result[:, 3] > 0)[0]:
+        visited[i] = True
+        queue.append((i, result[i]))
+
+    DIRS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+
+    while queue:
+        i, prop_color = queue.popleft()
+        px = int(positions[i, 0])
+        py = int(positions[i, 1])
+        pz = int(positions[i, 2])
+
+        for dx, dy, dz in DIRS:
+            nb_pos = (px + dx, py + dy, pz + dz)
+            j = pos_map.get(nb_pos)
+            if j is None or visited[j]:
+                continue
+            visited[j] = True
+
+            if invalid_mask[j]:
+                # Rellenar con el color propagado y forzar alpha opaco
+                result[j] = prop_color
+                result[j, 3] = 255
+                queue.append((j, prop_color))
+            else:
+                # Vóxel válido (interior u otro surface): propaga su propio color
+                queue.append((j, result[j]))
+
+    return result
 
 
 def _remove_shadow_from_colors(

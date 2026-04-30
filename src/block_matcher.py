@@ -158,12 +158,14 @@ class BlockMatcher:
                     hint = str(grid.shape_hints[i])
                     block_id, props = _apply_shape(block_id, hint)
                 else:
+                    hint = 'solid'
                     props = {}
                 surface_indices.append(i)
             else:
                 block_id = self.interior_block
+                hint = 'solid'
                 props = {}
-            entry: dict = {"pos": pos, "block": block_id}
+            entry: dict = {"pos": pos, "block": block_id, "_hint": hint}
             if props:
                 entry["properties"] = props
             result.append(entry)
@@ -192,7 +194,23 @@ class BlockMatcher:
         if self.use_shapes:
             _fix_wall_connections(result)
 
+        # Limpiar campos internos antes de devolver
+        for a in result:
+            a.pop("_hint", None)
+
         return result
+
+
+# ---------------------------------------------------------------------------
+# Helper: extraer bloque base (sin variante de forma)
+# ---------------------------------------------------------------------------
+
+def _base_block_id(block_id: str) -> str:
+    """Devuelve el ID del bloque sólido base eliminando sufijos _stairs/_slab/_wall."""
+    for suffix in ("_stairs", "_slab", "_wall"):
+        if block_id.endswith(suffix):
+            return block_id[: -len(suffix)]
+    return block_id
 
 
 # ---------------------------------------------------------------------------
@@ -256,13 +274,19 @@ def _apply_region_consistency(
 
         # Si la región es suficientemente grande → moda de bloques
         if len(members) >= min_region_size:
-            # Extraer los block IDs base (sin variantes de forma para la votación)
-            base_ids = [assignments[surface_indices[m]]["block"] for m in members]
+            # Votar por el bloque BASE (ignorar variantes de forma para votar)
+            base_ids = [_base_block_id(assignments[surface_indices[m]]["block"]) for m in members]
             from collections import Counter
-            winner = Counter(base_ids).most_common(1)[0][0]
+            winner_base = Counter(base_ids).most_common(1)[0][0]
             for m in members:
                 gi = surface_indices[m]
-                assignments[gi]["block"] = winner
+                hint = assignments[gi].get("_hint", "solid")
+                new_block, new_props = _apply_shape(winner_base, hint)
+                assignments[gi]["block"] = new_block
+                if new_props:
+                    assignments[gi]["properties"] = new_props
+                elif "properties" in assignments[gi]:
+                    del assignments[gi]["properties"]
 
         current_region += 1
 
@@ -298,10 +322,17 @@ def _apply_run_consistency(
     def _process_run(run: list[int]) -> None:
         if len(run) < min_run_length:
             return
-        base_ids = [assignments[surface_indices[m]]["block"] for m in run]
-        winner = Counter(base_ids).most_common(1)[0][0]
+        base_ids = [_base_block_id(assignments[surface_indices[m]]["block"]) for m in run]
+        winner_base = Counter(base_ids).most_common(1)[0][0]
         for m in run:
-            assignments[surface_indices[m]]["block"] = winner
+            gi = surface_indices[m]
+            hint = assignments[gi].get("_hint", "solid")
+            new_block, new_props = _apply_shape(winner_base, hint)
+            assignments[gi]["block"] = new_block
+            if new_props:
+                assignments[gi]["properties"] = new_props
+            elif "properties" in assignments[gi]:
+                del assignments[gi]["properties"]
 
     # Agrupar posiciones por (Y, Z) → barrer eje X
     from collections import defaultdict
