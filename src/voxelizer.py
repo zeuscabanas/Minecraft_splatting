@@ -109,97 +109,27 @@ def voxelize(
     # 1. Escalar la malla para que quepa exactamente en target_size
     mesh_scaled = _scale_mesh(mesh, W, H, D)
 
-    # 2. Voxelización a alta resolución + relleno + downsampling.
-    #
-    #    El problema de huecos en TRELLIS viene de que los meshes no son
-    #    herméticos y los triángulos finos caen entre vóxeles coarse.
-    #    Solución: voxelizar a 4× resolución (pitch=0.25), rellenar
-    #    con scipy.ndimage.binary_fill_holes (implementación C, rápida),
-    #    y luego hacer downsample any() al grid coarse objetivo.
-    #
-    #    - fine_factor=4: fine cell = 0.25 coarse voxels → captura todos
-    #      los triángulos que antes caían en huecos entre vóxeles.
-    #    - binary_fill_holes: equivalente a BFS exterior pero en C;
-    #      opera sobre el grid fino donde los gaps son 4× más pequeños
-    #      y por tanto se cierran solos.
-    #    - Downsample: coarse[x,y,z] = any(fine[4x:4x+4, 4y:4y+4, 4z:4z+4])
-    #
-    from scipy.ndimage import binary_fill_holes as _bfh
-    from scipy.ndimage import binary_closing as _bclosing
-    from scipy.ndimage import label as _label
-
-    # Factor de subdivisión: cap para modelos muy grandes (memoria)
-    fine_factor = 4 if max(W, H, D) <= 128 else 2
-    fine_pitch = 1.0 / fine_factor
-    FW, FH, FD = W * fine_factor, H * fine_factor, D * fine_factor
-
-    print(f"[VOX] grid objetivo: {W}×{H}×{D}  |  fine_factor={fine_factor}  |  grid fino: {FW}×{FH}×{FD}")
+    # 2. Voxelización directa a resolución objetivo (pitch=1.0)
+    print(f"[VOX] grid objetivo: {W}×{H}×{D}")
     print(f"[VOX] fill_interior={fill_interior}  |  shadow_removal={shadow_removal}")
 
-    vox_fine = mesh_scaled.voxelized(pitch=fine_pitch)
-    fine_pts = np.floor(vox_fine.points * fine_factor).astype(int)
-    fine_pts[:, 0] = np.clip(fine_pts[:, 0], 0, FW - 1)
-    fine_pts[:, 1] = np.clip(fine_pts[:, 1], 0, FH - 1)
-    fine_pts[:, 2] = np.clip(fine_pts[:, 2], 0, FD - 1)
+    vox = mesh_scaled.voxelized(pitch=1.0)
+    pts = np.floor(vox.points).astype(int)
+    pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+    pts[:, 2] = np.clip(pts[:, 2], 0, D - 1)
 
-    fine_shell = np.zeros((FW, FH, FD), dtype=bool)
-    fine_shell[fine_pts[:, 0], fine_pts[:, 1], fine_pts[:, 2]] = True
-    print(f"[VOX] cáscara fina cruda: {fine_shell.sum():,} celdas")
+    occupied = np.zeros((W, H, D), dtype=bool)
+    occupied[pts[:, 0], pts[:, 1], pts[:, 2]] = True
+    print(f"[VOX] cáscara cruda: {occupied.sum():,} vóxeles")
 
-    # Paso 1: closing fino para sellar gaps sub-vóxel
-    fine_shell = _bclosing(fine_shell, iterations=1)
-    print(f"[VOX] cáscara fina tras closing(1): {fine_shell.sum():,} celdas")
-
-    # Paso 2: downsample cáscara al grid coarse
-    fine_crop_shell = fine_shell[:W * fine_factor, :H * fine_factor, :D * fine_factor]
-    coarse_shell = (
-        fine_crop_shell
-        .reshape(W, fine_factor, H, fine_factor, D, fine_factor)
-        .any(axis=(1, 3, 5))
-    )
-    print(f"[VOX] cáscara coarse tras downsample: {coarse_shell.sum():,} vóxeles")
-
-    # Paso 3: closing coarse para sellar gaps de 1-2 bloques
-    coarse_shell = _bclosing(coarse_shell, iterations=2)
-    print(f"[VOX] cáscara coarse tras closing(2): {coarse_shell.sum():,} vóxeles")
-
-    # Paso 4: rellenar sólido completo
-    occupied = _bfh(coarse_shell)
-    solid_count = occupied.sum()
-    print(f"[VOX] sólido tras binary_fill_holes: {solid_count:,} vóxeles")
-
-    # Diagnóstico de fugas: si fill_holes no rellenó nada, la cáscara sigue abierta
-    added_by_fill = int(solid_count) - int(coarse_shell.sum())
-    print(f"[VOX] vóxeles añadidos por fill_holes: {added_by_fill:,}  ({'OK — se rellenó interior' if added_by_fill > 0 else '⚠ NADA — cáscara posiblemente abierta'})")
-
-    # Diagnóstico de agujeros visibles
-    empty_grid = ~occupied
-    _lbl, _nlbl = _label(empty_grid)
-    _ext_lbl = _lbl[0, 0, 0]
-    _ext_size = int((_lbl == _ext_lbl).sum())
-    _int_size = int(empty_grid.sum()) - _ext_size
-    _expected_ext = int(empty_grid.sum()) - _int_size
-    _leak = _ext_size - _expected_ext
-    print(f"[VOX] diagnóstico sólido → exterior={_ext_size:,}  interior_cerrado={_int_size:,}  fuga={_leak}")
-
-    # En modo hueco: extraer solo la cáscara superficial
-    if not fill_interior:
-        padded = np.pad(occupied, 1, constant_values=False)
-        has_empty_nb = np.zeros((W, H, D), dtype=bool)
-        for _dx, _dy, _dz in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
-            has_empty_nb |= ~padded[1+_dx:W+1+_dx, 1+_dy:H+1+_dy, 1+_dz:D+1+_dz]
-        occupied = occupied & has_empty_nb
-        print(f"[VOX] modo HUECO → cáscara final: {occupied.sum():,} vóxeles")
-
-        # Diagnóstico de agujeros en la cáscara final
-        empty2 = ~occupied
-        _lbl2, _nlbl2 = _label(empty2)
-        _ext2 = int((_lbl2 == _lbl2[0,0,0]).sum())
-        _int2 = int(empty2.sum()) - _ext2
-        _leak2 = _ext2 - (int(empty2.sum()) - _int2)
-        print(f"[VOX] diagnóstico cáscara → exterior={_ext2:,}  cámaras_internas={_nlbl2-1}  fuga={_leak2}")
-    else:
+    # 3. Relleno interior opcional
+    if fill_interior:
+        from scipy.ndimage import binary_fill_holes as _bfh
+        occupied = _bfh(occupied)
         print(f"[VOX] modo SÓLIDO → total: {occupied.sum():,} vóxeles")
+    else:
+        print(f"[VOX] modo HUECO → cáscara: {occupied.sum():,} vóxeles")
 
     # 4. Extraer posiciones desde el grid resultante
     xs, ys, zs = np.where(occupied)
