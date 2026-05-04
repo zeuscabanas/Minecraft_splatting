@@ -2,7 +2,7 @@
 
 Convert any image or 3D model into a **Minecraft structure** (.nbt / .schem) using [TRELLIS](https://github.com/microsoft/TRELLIS) as the AI 3D reconstruction backend.
 
-![Python](https://img.shields.io/badge/Python-3.12%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.12%2B-blue) ![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey) ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
 
 ---
 
@@ -246,7 +246,10 @@ This project patches 4 files inside the TRELLIS installation to add SDPA attenti
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+[Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](LICENSE)
+
+Free to use, share and adapt for non-commercial purposes with attribution.  
+For commercial use, contact the author.
 
 ---
 
