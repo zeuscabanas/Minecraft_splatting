@@ -84,26 +84,125 @@ Run the GUI:
 
 ---
 
+## Interface
+
+![GUI Screenshot](Interfaz.png)
+
+The GUI is divided into two panels: the **left panel** handles all configuration, and the **right panel** shows the 3D preview and the block palette.
+
+---
+
+## Left Panel — Options Reference
+
+### PASO 0: IMAGEN → GLB (TRELLIS)
+
+This section generates a textured 3D model from an image using the TRELLIS AI pipeline.
+
+| Element | Description |
+|---|---|
+| **TRELLIS disponible** | Green indicator — confirms that TRELLIS is installed and reachable under Python 3.12 |
+| **Imagen** | Path to the input image (PNG / JPG). Browse with the folder icon |
+| **Eliminar fondo (rembg)** | When checked, automatically removes the image background before sending it to TRELLIS, improving 3D reconstruction quality |
+| **Generar GLB** | Runs the TRELLIS pipeline in a background subprocess. The resulting `.glb` file is auto-filled in the input path below |
+
+---
+
+### ENTRADA / SALIDA
+
+| Element | Description |
+|---|---|
+| **Modelo GLB** | Path to the `.glb` 3D mesh to convert. Can be any GLB file — it does not have to come from TRELLIS |
+| **Archivo salida** | Path for the output file (`.nbt` or `.schem`). The extension is set automatically based on the **Formato** option |
+
+---
+
+### TAMAÑO
+
+| Element | Description |
+|---|---|
+| **W × H × D** | Explicit target dimensions in blocks (Width × Height × Depth). The model is scaled to fit exactly these bounds |
+| **Máximo (preserva proporciones)** | Sets the longest axis to the given number of blocks and scales the other two axes proportionally, preserving the model's aspect ratio |
+
+---
+
+### OPCIONES
+
+| Option | Default | Description |
+|---|---|---|
+| **Versión MC** | 1.21 | Minecraft version selector (1.20.1 → 1.21.4). Affects available block IDs and property names in the output |
+| **Formato** | nbt | Output format: `nbt` (Structure Block / Create mod) or `schem` (WorldEdit / Litematica) |
+| **Hueco (sin relleno)** | ✅ On | Generates only the outer shell of the model, leaving the interior empty. Turn off for fully solid structures |
+| **Escaleras / Losas / Muros** | ✅ On | Allows the block matcher to assign stair, slab and wall variants in addition to full blocks, producing smoother diagonal surfaces |
+| **Incluir vidrio / translúcidos** | ☐ Off | Adds glass and other translucent blocks to the matching palette. Useful for models with transparent or glassy zones |
+| **Corrección de sombras** | ✅ On | Applies CLAHE luminosity normalization to compensate the baked ambient occlusion / shadows that TRELLIS bakes into textures. Recommended for TRELLIS-generated models |
+| **Fraccionar en 8 partes** | ☐ Off | Splits the output into 8 spatial octants, each saved as a separate file. Required for large structures that exceed the 250 KB NBT limit imposed by the Create mod |
+
+---
+
+### Consistencia contextual de bloques
+
+These sliders control a two-pass post-processing step that reduces visual noise by enforcing block consistency across neighbouring voxels.
+
+| Slider | Default | Description |
+|---|---|---|
+| **ΔE región** | 8.0 | Maximum CIE LAB color distance for two adjacent voxels to be considered the same region. Lower values create more, smaller regions; higher values merge more voxels into large regions |
+| **Región mín** | 4 | Minimum number of voxels a flood-fill region must have to trigger a consistency vote. Regions smaller than this are left unchanged |
+| **ΔE línea** | 10.0 | Maximum color distance for a horizontal run of voxels to be treated as a single material line. Applied in a second pass after region consistency |
+| **Run mín** | 3 | Minimum run length (in voxels) before the run consistency pass forces all voxels in the run to the majority block type |
+
+> **Tip:** Set both ΔE sliders to 0 and both min sliders to a very large number to disable consistency entirely and keep the raw per-voxel color match.
+
+---
+
+### Progress bar and status
+
+The bar at the bottom fills during conversion. The label on the right shows the current step (`Listo.` when done, or an error message if something went wrong). All `[VOX]` diagnostic messages from the voxelizer are printed to the log area below the bar.
+
+---
+
+## Right Panel — Reference
+
+### Vista Previa GLB
+
+Interactive 3D viewer for the loaded GLB file.
+
+| Interaction | Action |
+|---|---|
+| **Left-click drag** | Rotate the model |
+| **Scroll wheel** | Zoom in / out |
+
+The status line below the viewer shows the file name, vertex count and face count.
+
+### Paleta de Bloques
+
+Controls which Minecraft blocks are available for color matching.
+
+| Element | Description |
+|---|---|
+| **Preset** | Load a predefined block set (e.g. *Todo*, or material-specific presets) |
+| **Todo / Nada** | Enable or disable all blocks at once |
+| **Category icons** | Filter the list by material category (stone, wood, metal, glass, etc.) |
+| **Search bar** | Type to filter blocks by name |
+| **Color swatches** | Each swatch represents one enabled block. Click to toggle individual blocks on/off |
+| **Counter** | Shows how many blocks are currently enabled out of the total available |
+
+---
+
 ## Usage
 
-### PASO 0 — Image → GLB (TRELLIS)
-1. Select an input image (PNG/JPG)
-2. Adjust simplification and texture size
-3. Click **Generar GLB** — TRELLIS will run in the background and generate a `.glb` file
-4. The GLB preview panel will show the result; drag to rotate, scroll to zoom
+### Step 1 — Generate the GLB (optional, TRELLIS)
+1. Select an input image with **Imagen**
+2. Optionally enable **Eliminar fondo** to strip the background
+3. Click **Generar GLB** — the AI pipeline runs in the background
+4. When done the GLB path is auto-filled and the 3D preview updates
 
-### PASO 1 — GLB → Minecraft structure
-1. Select or confirm the GLB path
-2. Set the output path (`.nbt` or `.schem`)
-3. Configure options:
-   - Target size (W×H×D or max dimension)
-   - Hollow / filled interior
-   - Stairs, slabs, walls
-   - Transparent blocks
-   - Shadow correction
-   - Contextual consistency sliders (ΔE region, run length…)
-   - Split into 8 parts (for large structures)
-4. Click **Convertir a Minecraft**
+### Step 2 — Configure and generate
+1. Confirm or change the **Modelo GLB** path
+2. Set the **Archivo salida** path
+3. Choose **W × H × D** or **Máximo** size mode
+4. Adjust options (hollow, shadows, consistency…)
+5. Select the desired blocks in the **Paleta de Bloques**
+6. Click **GENERAR**
 
 ### Loading in Minecraft
 - `.nbt` → place with a **Structure Block** (Load mode) or use [Create mod](https://modrinth.com/mod/create) schematic cannon
